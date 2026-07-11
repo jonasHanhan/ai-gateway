@@ -132,10 +132,20 @@ func (c *GatewayController) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	uid := c.uuidFn()
 
+	// Fetch GatewayConfig to get global LLM request cost defaults.
+	gwConfig, err := c.fetchGatewayConfig(ctx, gw)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	var defaultLLMCosts []aigv1b1.LLMRequestCost
+	if gwConfig != nil {
+		defaultLLMCosts = gwConfig.Spec.GlobalLLMRequestCosts
+	}
+
 	// We need to create the filter config in Envoy Gateway system namespace because the sidecar extproc need
 	// to access it.
 	var hasEffectiveRoutes bool // indicates whether the filter config is effective (i.e., there is at least one active route).
-	hasEffectiveRoutes, err = c.reconcileFilterConfigSecret(ctx, FilterConfigSecretPerGatewayName(gw.Name, gw.Namespace), namespace, aiRoutes.Items, mcpRoutes.Items, uid)
+	hasEffectiveRoutes, err = c.reconcileFilterConfigSecret(ctx, FilterConfigSecretPerGatewayName(gw.Name, gw.Namespace), namespace, aiRoutes.Items, mcpRoutes.Items, uid, defaultLLMCosts)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -193,97 +203,49 @@ func bodyMutationToFilterAPI(m *aigv1b1.HTTPBodyMutation) *filterapi.HTTPBodyMut
 	return ret
 }
 
-type routeLLMRequestCost struct {
-	routeName string
-	expr      string
+// validateCELExpression validates and returns a CEL expression for cost calculation.
+func validateCELExpression(cost aigv1b1.LLMRequestCost) (string, error) {
+	if cost.CEL == nil {
+		return "", fmt.Errorf("missing CEL expression")
+	}
+	expr := *cost.CEL
+	if _, err := llmcostcel.NewProgram(expr); err != nil {
+		return "", fmt.Errorf("invalid CEL expression: %w", err)
+	}
+	return expr, nil
 }
 
-func llmRequestCostToCELExpression(cost aigv1b1.LLMRequestCost) (string, error) {
-	switch cost.Type {
-	case aigv1b1.LLMRequestCostTypeInputToken:
-		return "input_tokens", nil
-	case aigv1b1.LLMRequestCostTypeCachedInputToken:
-		return "cached_input_tokens", nil
-	case aigv1b1.LLMRequestCostTypeCacheCreationInputToken:
-		return "cache_creation_input_tokens", nil
-	case aigv1b1.LLMRequestCostTypeOutputToken:
-		return "output_tokens", nil
-	case aigv1b1.LLMRequestCostTypeTotalToken:
-		return "total_tokens", nil
-	case aigv1b1.LLMRequestCostTypeCEL:
-		if cost.CEL == nil {
-			return "", fmt.Errorf("missing CEL expression")
-		}
-		expr := *cost.CEL
-		if _, err := llmcostcel.NewProgram(expr); err != nil {
-			return "", fmt.Errorf("invalid CEL expression: %w", err)
-		}
-		return expr, nil
-	default:
-		return "", fmt.Errorf("unknown request cost type: %s", cost.Type)
+// aigwLLMRequestCostToFilterAPI converts an API LLMRequestCost to filter API form for the given
+// AIGatewayRoute (routeName is "namespace/name").
+func aigwGlobalLLMRequestCostToFilterAPI(cost aigv1b1.LLMRequestCost) (filterapi.GlobalLLMRequestCost, error) {
+	out := filterapi.GlobalLLMRequestCost{
+		MetadataKey: cost.MetadataKey,
+		Type:        filterapi.LLMRequestCostType(cost.Type),
 	}
-}
-
-func routeNameMatchCondition(routeName string) string {
-	if routeName == "" {
-		return "false"
-	}
-	escaped := strings.ReplaceAll(routeName, `'`, `\'`)
-	return fmt.Sprintf("route_name == '%s'", escaped)
-}
-
-func aggregateRouteLLMRequestCosts(
-	costsByMetadata map[string][]routeLLMRequestCost,
-	metadataOrder *[]string,
-	routeName string,
-	routeCosts []aigv1b1.LLMRequestCost,
-) error {
-	if len(routeCosts) == 0 {
-		return nil
-	}
-	for _, cost := range routeCosts {
-		expr, err := llmRequestCostToCELExpression(cost)
+	if cost.Type == aigv1b1.LLMRequestCostTypeCEL {
+		celExpr, err := validateCELExpression(cost)
 		if err != nil {
-			return err
+			return filterapi.GlobalLLMRequestCost{}, err
 		}
-		metadataKey := cost.MetadataKey
-		if _, exists := costsByMetadata[metadataKey]; !exists {
-			*metadataOrder = append(*metadataOrder, metadataKey)
-		}
-		costsByMetadata[metadataKey] = append(costsByMetadata[metadataKey], routeLLMRequestCost{
-			routeName: routeName,
-			expr:      expr,
-		})
+		out.CEL = celExpr
 	}
-	return nil
+	return out, nil
 }
 
-func aggregatedLLMRequestCosts(
-	costsByMetadata map[string][]routeLLMRequestCost,
-	metadataOrder []string,
-) ([]filterapi.LLMRequestCost, error) {
-	ret := make([]filterapi.LLMRequestCost, 0, len(metadataOrder))
-	for _, metadataKey := range metadataOrder {
-		costs := costsByMetadata[metadataKey]
-		if len(costs) == 0 {
-			continue
-		}
-		expr := "uint(0)"
-		// Keep "last definition wins" semantics for duplicate metadata keys by
-		// layering conditions in declaration order.
-		for _, cost := range costs {
-			expr = fmt.Sprintf("%s ? (uint(%s)) : (%s)", routeNameMatchCondition(cost.routeName), cost.expr, expr)
-		}
-		if _, err := llmcostcel.NewProgram(expr); err != nil {
-			return nil, fmt.Errorf("invalid aggregated CEL expression for metadata key %q: %w", metadataKey, err)
-		}
-		ret = append(ret, filterapi.LLMRequestCost{
-			MetadataKey: metadataKey,
-			Type:        filterapi.LLMRequestCostTypeCEL,
-			CEL:         expr,
-		})
+func aigwLLMRequestCostToFilterAPI(cost aigv1b1.LLMRequestCost, routeName string) (filterapi.LLMRequestCost, error) {
+	out := filterapi.LLMRequestCost{
+		MetadataKey: cost.MetadataKey,
+		RouteName:   routeName,
+		Type:        filterapi.LLMRequestCostType(cost.Type),
 	}
-	return ret, nil
+	if cost.Type == aigv1b1.LLMRequestCostTypeCEL {
+		celExpr, err := validateCELExpression(cost)
+		if err != nil {
+			return filterapi.LLMRequestCost{}, err
+		}
+		out.CEL = celExpr
+	}
+	return out, nil
 }
 
 // mergeBodyMutations merges route-level and backend-level BodyMutation with route-level taking precedence.
@@ -388,12 +350,24 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 	aiGatewayRoutes []aigv1b1.AIGatewayRoute,
 	mcpRoutes []aigv1a1.MCPRoute,
 	uuid string,
+	defaultLLMCosts []aigv1b1.LLMRequestCost,
 ) (hasEffectiveRoute bool, _ error) {
 	// Precondition: aiGatewayRoutes is not empty as we early return if it is empty.
 	ec := &filterapi.Config{UUID: uuid, Version: version.Parse()}
 	var err error
-	llmCostsByMetadata := map[string][]routeLLMRequestCost{}
-	llmCostMetadataOrder := []string{}
+
+	// Process global LLM request costs from GatewayConfig.
+	// These have no RouteName and serve as defaults.
+	// Note: The CRD enforces uniqueness via +listType=map and +listMapKey=metadataKey,
+	// so we don't need to deduplicate here.
+	for _, cost := range defaultLLMCosts {
+		fc, convErr := aigwGlobalLLMRequestCostToFilterAPI(cost)
+		if convErr != nil {
+			return false, fmt.Errorf("failed to convert global LLMRequestCosts: %w", convErr)
+		}
+		ec.GlobalLLMRequestCosts = append(ec.GlobalLLMRequestCosts, fc)
+	}
+
 	for i := range aiGatewayRoutes {
 		aiGatewayRoute := &aiGatewayRoutes[i]
 		if !aiGatewayRoute.GetDeletionTimestamp().IsZero() {
@@ -494,14 +468,20 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 			}
 		}
 		if len(routeBackendNames) > 0 {
-			if err = aggregateRouteLLMRequestCosts(llmCostsByMetadata, &llmCostMetadataOrder, routeName, aiGatewayRoute.Spec.LLMRequestCosts); err != nil {
-				return false, fmt.Errorf("failed to aggregate LLMRequestCosts for route %s: %w", aiGatewayRoute.Name, err)
+			// Dedup per (metadataKey, routeName): last definition wins.
+			dedup := map[string]filterapi.LLMRequestCost{}
+			for _, cost := range aiGatewayRoute.Spec.LLMRequestCosts {
+				fc, convErr := aigwLLMRequestCostToFilterAPI(cost, routeName)
+				if convErr != nil {
+					return false, fmt.Errorf("failed to convert LLMRequestCosts for route %s: %w", aiGatewayRoute.Name, convErr)
+				}
+				key := fc.MetadataKey
+				dedup[key] = fc
+			}
+			for _, fc := range dedup {
+				ec.LLMRequestCosts = append(ec.LLMRequestCosts, fc)
 			}
 		}
-	}
-	ec.LLMRequestCosts, err = aggregatedLLMRequestCosts(llmCostsByMetadata, llmCostMetadataOrder)
-	if err != nil {
-		return false, err
 	}
 
 	// Configuration for MCP processor.
@@ -566,6 +546,8 @@ func mcpConfig(mcpRoutes []aigv1a1.MCPRoute) (_ *filterapi.MCPConfig, hasEffecti
 				mcpBackend.ToolSelector = &filterapi.MCPToolSelector{
 					Include:      b.ToolSelector.Include,
 					IncludeRegex: b.ToolSelector.IncludeRegex,
+					Exclude:      b.ToolSelector.Exclude,
+					ExcludeRegex: b.ToolSelector.ExcludeRegex,
 				}
 			}
 			mcpRoute.Backends = append(
@@ -1053,4 +1035,32 @@ func (c *GatewayController) getObjectsForGateway(ctx context.Context, gw *gwapiv
 		namespace = daemonSets[0].Namespace
 	}
 	return
+}
+
+// fetchGatewayConfig returns the referenced GatewayConfig (if present) for the given Gateway.
+// Returns nil if no GatewayConfig is referenced or if it cannot be found.
+// fetchGatewayConfig returns the referenced GatewayConfig (if present) for the given Gateway.
+// Returns (nil, nil) if: no annotation, empty annotation, or GatewayConfig not found.
+// Returns (nil, error) for transient failures (API errors) to trigger reconciliation retry.
+func (c *GatewayController) fetchGatewayConfig(ctx context.Context, gw *gwapiv1.Gateway) (*aigv1b1.GatewayConfig, error) {
+	configName, ok := gw.Annotations[GatewayConfigAnnotationKey]
+	if !ok || configName == "" {
+		return nil, nil
+	}
+
+	// Fetch the GatewayConfig (must be in same namespace as Gateway).
+	var gatewayConfig aigv1b1.GatewayConfig
+	if err := c.client.Get(ctx, client.ObjectKey{Name: configName, Namespace: gw.Namespace}, &gatewayConfig); err != nil {
+		if apierrors.IsNotFound(err) {
+			c.logger.Info("GatewayConfig referenced by Gateway not found, using defaults",
+				"gateway_name", gw.Name, "gateway_namespace", gw.Namespace, "gatewayconfig_name", configName)
+			return nil, nil
+		}
+		// Return error for transient failures (e.g., API errors) to trigger retry.
+		return nil, fmt.Errorf("failed to get GatewayConfig: %w", err)
+	}
+
+	c.logger.Info("found GatewayConfig for Gateway",
+		"gateway_name", gw.Name, "gateway_namespace", gw.Namespace, "gatewayconfig_name", configName)
+	return &gatewayConfig, nil
 }

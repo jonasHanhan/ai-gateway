@@ -35,6 +35,21 @@ import (
 	"github.com/envoyproxy/ai-gateway/internal/llmcostcel"
 )
 
+// requireLLMRequestCostsEqual asserts two LLMRequestCost slices are equal, printing a go-cmp diff on failure.
+func requireLLMRequestCostsEqual(t *testing.T, want, got []filterapi.LLMRequestCost) {
+	t.Helper()
+	// Compare as sets (order-agnostic) since map iteration order is non-deterministic.
+	less := func(a, b filterapi.LLMRequestCost) bool {
+		if a.RouteName != b.RouteName {
+			return a.RouteName < b.RouteName
+		}
+		return a.MetadataKey < b.MetadataKey
+	}
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(less)); diff != "" {
+		t.Fatalf("LLMRequestCosts not equal (-want +got):\n%s", diff)
+	}
+}
+
 func TestGatewayController_Reconcile(t *testing.T) {
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	fakeKube := fake2.NewClientset()
@@ -204,7 +219,7 @@ func TestGatewayController_reconcileFilterConfigSecret(t *testing.T) {
 					{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "orange"}}},
 				},
 				LLMRequestCosts: []aigv1b1.LLMRequestCost{
-					{MetadataKey: "foo", Type: aigv1b1.LLMRequestCostTypeInputToken}, // This should be ignored as it has the duplicate key.
+					{MetadataKey: "foo", Type: aigv1b1.LLMRequestCostTypeInputToken}, // Same metadataKey as route1; scoped to this route in filter config.
 					{MetadataKey: "cat", Type: aigv1b1.LLMRequestCostTypeCEL, CEL: ptr.To(`backend == 'foo.default' ?  input_tokens + output_tokens : total_tokens`)},
 				},
 			},
@@ -261,7 +276,7 @@ func TestGatewayController_reconcileFilterConfigSecret(t *testing.T) {
 	for range 2 { // Reconcile twice to make sure the secret update path is working.
 		const someNamespace = "some-namespace"
 		configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
-		effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid")
+		effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid", nil)
 		require.NoError(t, err)
 		require.True(t, effective, "expected filter config to be effective")
 
@@ -272,32 +287,28 @@ func TestGatewayController_reconcileFilterConfigSecret(t *testing.T) {
 		var fc filterapi.Config
 		require.NoError(t, yaml.Unmarshal([]byte(configStr), &fc))
 		require.Equal(t, "dev", fc.Version)
-		require.Len(t, fc.LLMRequestCosts, 6)
-		costByMetadata := map[string]filterapi.LLMRequestCost{}
-		for _, cost := range fc.LLMRequestCosts {
-			costByMetadata[cost.MetadataKey] = cost
+		wantLLMRequestCosts := []filterapi.LLMRequestCost{
+			{MetadataKey: "foo", RouteName: "ns/route1", Type: filterapi.LLMRequestCostTypeInputToken},
+			{MetadataKey: "bar", RouteName: "ns/route1", Type: filterapi.LLMRequestCostTypeOutputToken},
+			{MetadataKey: "baz", RouteName: "ns/route1", Type: filterapi.LLMRequestCostTypeTotalToken},
+			{MetadataKey: "qux", RouteName: "ns/route1", Type: filterapi.LLMRequestCostTypeCachedInputToken},
+			{MetadataKey: "zoo", RouteName: "ns/route1", Type: filterapi.LLMRequestCostTypeCacheCreationInputToken},
+			{MetadataKey: "foo", RouteName: "ns/route2", Type: filterapi.LLMRequestCostTypeInputToken},
+			{
+				MetadataKey: "cat",
+				RouteName:   "ns/route2",
+				Type:        filterapi.LLMRequestCostTypeCEL,
+				CEL:         `backend == 'foo.default' ?  input_tokens + output_tokens : total_tokens`,
+			},
 		}
-		require.Len(t, costByMetadata, 6)
-		fooCost := costByMetadata["foo"]
-		require.Equal(t, filterapi.LLMRequestCostTypeCEL, fooCost.Type)
-		require.Contains(t, fooCost.CEL, "route_name == 'ns/route1' ? (uint(input_tokens))")
-		require.Contains(t, fooCost.CEL, "route_name == 'ns/route2' ? (uint(input_tokens))")
-		fooProg, err := llmcostcel.NewProgram(fooCost.CEL)
-		require.NoError(t, err)
-		fooVal, err := llmcostcel.EvaluateProgram(fooProg, "model", "any-backend", "ns/route1", 3, 0, 0, 4, 7)
-		require.NoError(t, err)
-		require.Equal(t, uint64(3), fooVal)
-		fooVal, err = llmcostcel.EvaluateProgram(fooProg, "model", "any-backend", "ns/route2", 3, 0, 0, 4, 7)
-		require.NoError(t, err)
-		require.Equal(t, uint64(3), fooVal)
-		fooVal, err = llmcostcel.EvaluateProgram(fooProg, "model", "unknown-backend", "unknown-route", 3, 0, 0, 4, 7)
-		require.NoError(t, err)
-		require.Equal(t, uint64(0), fooVal)
+		requireLLMRequestCostsEqual(t, wantLLMRequestCosts, fc.LLMRequestCosts)
 
-		catCost := costByMetadata["cat"]
-		require.Equal(t, filterapi.LLMRequestCostTypeCEL, catCost.Type)
-		require.Contains(t, catCost.CEL, "route_name == 'ns/route2'")
-		require.Contains(t, catCost.CEL, "backend == 'foo.default' ?  input_tokens + output_tokens : total_tokens")
+		catProg, err := llmcostcel.NewProgram(wantLLMRequestCosts[6].CEL)
+		require.NoError(t, err)
+		catVal, err := llmcostcel.EvaluateProgram(catProg, "model", "foo.default", "ns/route2", 3, 0, 0, 4, 7, 0)
+		require.NoError(t, err)
+		require.Equal(t, uint64(7), catVal)
+
 		require.Len(t, fc.Models, 1)
 		require.Equal(t, "mymodel", fc.Models[0].Name)
 
@@ -310,7 +321,7 @@ func TestGatewayController_reconcileFilterConfigSecret(t *testing.T) {
 }
 
 // TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostAggregation verifies that
-// route-level costs are aggregated into a single route-level expression per metadata key.
+// routes sharing the same metadataKey each get their own filter-config row (scoped by routeName).
 func TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostAggregation(t *testing.T) {
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
@@ -369,7 +380,7 @@ func TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostA
 
 	const someNamespace = "some-namespace"
 	configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
-	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid")
+	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid", nil)
 	require.NoError(t, err)
 	require.True(t, effective, "expected filter config to be effective")
 
@@ -380,27 +391,34 @@ func TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostA
 	var fc filterapi.Config
 	require.NoError(t, yaml.Unmarshal([]byte(configStr), &fc))
 
-	// Verify we have two backends and route-level costs only.
+	// Verify we have two backends and one filter-config row per route (same metadataKey).
 	require.Len(t, fc.Backends, 2, "expected 2 backends")
-	require.Len(t, fc.LLMRequestCosts, 1, "global costs should have a single aggregated entry")
-	require.Equal(t, "billing_charges", fc.LLMRequestCosts[0].MetadataKey)
-	require.Equal(t, filterapi.LLMRequestCostTypeCEL, fc.LLMRequestCosts[0].Type)
-	aggregatedExpr := fc.LLMRequestCosts[0].CEL
+	wantLLMRequestCosts := []filterapi.LLMRequestCost{
+		{
+			MetadataKey: "billing_charges",
+			RouteName:   "ns/free-model-route",
+			Type:        filterapi.LLMRequestCostTypeCEL,
+			CEL:         "0",
+		},
+		{
+			MetadataKey: "billing_charges",
+			RouteName:   "ns/paid-model-route",
+			Type:        filterapi.LLMRequestCostTypeCEL,
+			CEL:         "input_tokens + output_tokens",
+		},
+	}
+	requireLLMRequestCostsEqual(t, wantLLMRequestCosts, fc.LLMRequestCosts)
 
-	require.Contains(t, aggregatedExpr, "route_name == 'ns/free-model-route' ? (uint(0))")
-	require.Contains(t, aggregatedExpr, "route_name == 'ns/paid-model-route' ? (uint(input_tokens + output_tokens))")
-
-	prog, err := llmcostcel.NewProgram(aggregatedExpr)
+	freeProg, err := llmcostcel.NewProgram(wantLLMRequestCosts[0].CEL)
 	require.NoError(t, err)
-	val, err := llmcostcel.EvaluateProgram(prog, "model", "free-backend", "ns/free-model-route", 10, 0, 0, 5, 15)
+	val, err := llmcostcel.EvaluateProgram(freeProg, "model", "free-backend", "ns/free-model-route", 10, 0, 0, 5, 15, 0)
 	require.NoError(t, err)
 	require.Equal(t, uint64(0), val)
-	val, err = llmcostcel.EvaluateProgram(prog, "model", "paid-backend", "ns/paid-model-route", 10, 0, 0, 5, 15)
+	paidProg, err := llmcostcel.NewProgram(wantLLMRequestCosts[1].CEL)
+	require.NoError(t, err)
+	val, err = llmcostcel.EvaluateProgram(paidProg, "model", "paid-backend", "ns/paid-model-route", 10, 0, 0, 5, 15, 0)
 	require.NoError(t, err)
 	require.Equal(t, uint64(15), val)
-	val, err = llmcostcel.EvaluateProgram(prog, "model", "other-backend", "other-route", 10, 0, 0, 5, 15)
-	require.NoError(t, err)
-	require.Equal(t, uint64(0), val)
 }
 
 // TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostAggregation_DuplicateMetadataKey
@@ -438,7 +456,7 @@ func TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostA
 
 	const someNamespace = "some-namespace"
 	configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
-	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid")
+	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid", nil)
 	require.NoError(t, err)
 	require.True(t, effective, "expected filter config to be effective")
 
@@ -448,13 +466,15 @@ func TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostA
 	require.True(t, ok)
 	var fc filterapi.Config
 	require.NoError(t, yaml.Unmarshal([]byte(configStr), &fc))
-	require.Len(t, fc.LLMRequestCosts, 1)
-
-	prog, err := llmcostcel.NewProgram(fc.LLMRequestCosts[0].CEL)
-	require.NoError(t, err)
-	val, err := llmcostcel.EvaluateProgram(prog, "model", "test-backend", "ns/route-with-duplicate-metadata", 10, 0, 0, 5, 15)
-	require.NoError(t, err)
-	require.Equal(t, uint64(5), val, "duplicate metadata key should use the last definition (OutputToken)")
+	// Controller deduplicates same (metadataKey, routeName): last definition wins.
+	wantLLMRequestCosts := []filterapi.LLMRequestCost{
+		{
+			MetadataKey: "billing_charges",
+			RouteName:   "ns/route-with-duplicate-metadata",
+			Type:        filterapi.LLMRequestCostTypeOutputToken,
+		},
+	}
+	requireLLMRequestCostsEqual(t, wantLLMRequestCosts, fc.LLMRequestCosts)
 }
 
 // TestGatewayController_reconcileFilterConfigSecret_InvalidCELExpression tests that invalid CEL
@@ -493,7 +513,7 @@ func TestGatewayController_reconcileFilterConfigSecret_InvalidCELExpression(t *t
 
 	const someNamespace = "some-namespace"
 	configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
-	_, err = c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid")
+	_, err = c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid", nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "invalid CEL expression")
 }
@@ -587,7 +607,7 @@ func TestGatewayController_reconcileFilterConfigSecret_SkipsDeletedRoutes(t *tes
 	configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
 
 	// Reconcile filter config secret.
-	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid")
+	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid", nil)
 	require.NoError(t, err)
 	require.True(t, effective, "expected filter config to be effective")
 
@@ -1945,10 +1965,10 @@ func TestGatewayController_reconcileFilterMCPConfigSecret(t *testing.T) {
 	const someNamespace = "some-namespace"
 	configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
 
-	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, nil, nil, "mcp-uuid")
+	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, nil, nil, "mcp-uuid", nil)
 	require.NoError(t, err)
 	require.False(t, effective) // No MCP routes, so not effective.
-	effective, err = c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, nil, mcpRoutes, "mcp-uuid")
+	effective, err = c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, nil, mcpRoutes, "mcp-uuid", nil)
 	require.NoError(t, err)
 	require.True(t, effective)
 
@@ -1963,6 +1983,37 @@ func TestGatewayController_reconcileFilterMCPConfigSecret(t *testing.T) {
 	require.Equal(t, "mcp-uuid", fc.UUID)
 	require.NotNil(t, fc.MCPConfig)
 	require.Equal(t, "http://127.0.0.1:"+strconv.Itoa(internalapi.MCPBackendListenerPort), fc.MCPConfig.BackendListenerAddr)
+}
+
+func Test_mcpConfig_ToolSelectorExclude(t *testing.T) {
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{{
+					BackendObjectReference: gwapiv1.BackendObjectReference{
+						Name: gwapiv1.ObjectName("backend"),
+					},
+					ToolSelector: &aigv1a1.MCPToolFilter{
+						Include:      []string{"toolA"},
+						Exclude:      []string{"toolB"},
+						ExcludeRegex: []string{"^secret.*"},
+					},
+				}},
+			},
+		},
+	}
+
+	mc, effective := mcpConfig(mcpRoutes)
+	require.True(t, effective)
+	require.NotNil(t, mc)
+	require.Len(t, mc.Routes, 1)
+	require.Len(t, mc.Routes[0].Backends, 1)
+	ts := mc.Routes[0].Backends[0].ToolSelector
+	require.NotNil(t, ts)
+	require.Equal(t, []string{"toolA"}, ts.Include)
+	require.Equal(t, []string{"toolB"}, ts.Exclude)
+	require.Equal(t, []string{"^secret.*"}, ts.ExcludeRegex)
 }
 
 func Test_mergeHeaderMutations(t *testing.T) {
@@ -2222,6 +2273,148 @@ func Test_bodyMutationToFilterAPI(t *testing.T) {
 			if d := cmp.Diff(tt.expected, result); d != "" {
 				t.Errorf("bodyMutationToFilterAPI() mismatch (-expected +got):\n%s", d)
 			}
+		})
+	}
+}
+
+// TestGatewayController_reconcileFilterConfigSecret_GlobalDefaults tests that
+// global LLM request costs from GatewayConfig are properly included in the filter config
+// when no routes override them.
+func TestGatewayController_reconcileFilterConfigSecret_GlobalDefaults(t *testing.T) {
+	tests := []struct {
+		name                     string
+		globalCosts              []aigv1b1.LLMRequestCost
+		routes                   []aigv1b1.AIGatewayRoute
+		expectedGlobalCosts      []filterapi.GlobalLLMRequestCost
+		expectedRouteScopedCosts []filterapi.LLMRequestCost
+	}{
+		{
+			name: "global defaults only, no routes",
+			globalCosts: []aigv1b1.LLMRequestCost{
+				{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeInputToken},
+			},
+			routes: []aigv1b1.AIGatewayRoute{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "route1", Namespace: "ns"},
+					Spec: aigv1b1.AIGatewayRouteSpec{
+						Rules: []aigv1b1.AIGatewayRouteRule{
+							{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "backend1"}}},
+						},
+					},
+				},
+			},
+			expectedGlobalCosts: []filterapi.GlobalLLMRequestCost{
+				{MetadataKey: "billing_charges", Type: filterapi.LLMRequestCostTypeInputToken},
+			},
+			expectedRouteScopedCosts: nil, // No route-scoped costs
+		},
+		{
+			name: "global defaults with route override",
+			globalCosts: []aigv1b1.LLMRequestCost{
+				{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeInputToken},
+				{MetadataKey: "total_tokens", Type: aigv1b1.LLMRequestCostTypeTotalToken},
+			},
+			routes: []aigv1b1.AIGatewayRoute{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "premium-route", Namespace: "ns"},
+					Spec: aigv1b1.AIGatewayRouteSpec{
+						Rules: []aigv1b1.AIGatewayRouteRule{
+							{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "backend1"}}},
+						},
+						LLMRequestCosts: []aigv1b1.LLMRequestCost{
+							{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeOutputToken}, // Override global
+						},
+					},
+				},
+			},
+			expectedGlobalCosts: []filterapi.GlobalLLMRequestCost{
+				{MetadataKey: "billing_charges", Type: filterapi.LLMRequestCostTypeInputToken},
+				{MetadataKey: "total_tokens", Type: filterapi.LLMRequestCostTypeTotalToken},
+			},
+			expectedRouteScopedCosts: []filterapi.LLMRequestCost{
+				{MetadataKey: "billing_charges", RouteName: "ns/premium-route", Type: filterapi.LLMRequestCostTypeOutputToken},
+			},
+		},
+		{
+			name: "multiple routes with different overrides",
+			globalCosts: []aigv1b1.LLMRequestCost{
+				{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeInputToken},
+			},
+			routes: []aigv1b1.AIGatewayRoute{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "free-route", Namespace: "ns"},
+					Spec: aigv1b1.AIGatewayRouteSpec{
+						Rules: []aigv1b1.AIGatewayRouteRule{
+							{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "backend1"}}},
+						},
+						LLMRequestCosts: []aigv1b1.LLMRequestCost{
+							{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeCEL, CEL: ptr.To("0")}, // Free
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "standard-route", Namespace: "ns"},
+					Spec: aigv1b1.AIGatewayRouteSpec{
+						Rules: []aigv1b1.AIGatewayRouteRule{
+							{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "backend1"}}},
+						},
+						// No override - will use global default
+					},
+				},
+			},
+			expectedGlobalCosts: []filterapi.GlobalLLMRequestCost{
+				{MetadataKey: "billing_charges", Type: filterapi.LLMRequestCostTypeInputToken},
+			},
+			expectedRouteScopedCosts: []filterapi.LLMRequestCost{
+				{MetadataKey: "billing_charges", RouteName: "ns/free-route", Type: filterapi.LLMRequestCostTypeCEL, CEL: "0"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := requireNewFakeClientWithIndexes(t)
+			kube := fake2.NewClientset()
+			ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
+			c := NewGatewayController(fakeClient, kube, ctrl.Log,
+				"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
+
+			const gwNamespace = "ns"
+
+			// Create AIServiceBackend
+			backend := &aigv1b1.AIServiceBackend{
+				ObjectMeta: metav1.ObjectMeta{Name: "backend1", Namespace: gwNamespace},
+				Spec: aigv1b1.AIServiceBackendSpec{
+					BackendRef: gwapiv1.BackendObjectReference{Name: "some-backend", Namespace: ptr.To[gwapiv1.Namespace](gwNamespace)},
+				},
+			}
+			err := fakeClient.Create(t.Context(), backend)
+			require.NoError(t, err)
+
+			const someNamespace = "some-namespace"
+			configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
+			effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, tt.routes, nil, "test-uuid", tt.globalCosts)
+			require.NoError(t, err)
+			require.True(t, effective)
+
+			secret, err := kube.CoreV1().Secrets(someNamespace).Get(t.Context(), configName, metav1.GetOptions{})
+			require.NoError(t, err)
+			configStr, ok := secret.StringData[FilterConfigKeyInSecret]
+			require.True(t, ok)
+
+			var fc filterapi.Config
+			require.NoError(t, yaml.Unmarshal([]byte(configStr), &fc))
+
+			// Compare global costs (order-agnostic)
+			if diff := cmp.Diff(tt.expectedGlobalCosts, fc.GlobalLLMRequestCosts,
+				cmpopts.SortSlices(func(a, b filterapi.GlobalLLMRequestCost) bool {
+					return a.MetadataKey < b.MetadataKey
+				})); diff != "" {
+				t.Errorf("GlobalLLMRequestCosts mismatch (-want +got):\n%s", diff)
+			}
+
+			// Compare route-scoped costs (order-agnostic)
+			requireLLMRequestCostsEqual(t, tt.expectedRouteScopedCosts, fc.LLMRequestCosts)
 		})
 	}
 }
